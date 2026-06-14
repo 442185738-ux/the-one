@@ -1,0 +1,135 @@
+name: Mirror image URLs to GitHub raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Optional: paste image URLs here, one URL per line. If empty, image_urls.txt is used."
+        required: false
+        type: string
+      output_dir:
+        description: "Output folder in repository"
+        required: false
+        default: "public-images"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download images from image_urls.txt
+        env:
+          URLS_INPUT: ${{ inputs.urls }}
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlparse
+          import mimetypes
+          import os
+          import time
+
+          urls_input = os.environ.get("URLS_INPUT", "").strip()
+          urls_path = Path("image_urls.txt")
+          out_dir = Path(os.environ.get("OUTPUT_DIR", "public-images").strip() or "public-images")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          if urls_input:
+              raw_url_text = urls_input
+              urls_path.write_text(raw_url_text.strip() + "\n", encoding="utf-8")
+          else:
+              raw_url_text = urls_path.read_text(encoding="utf-8")
+
+          urls = [line.strip() for line in raw_url_text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+              "Referer": "https://img.contentcube.cn/",
+          }
+
+          manifest = []
+          failures = []
+
+          def ext_from_response(url, content_type):
+              parsed_path = urlparse(url).path
+              suffix = Path(parsed_path).suffix.lower()
+              if suffix in [".png", ".jpg", ".jpeg", ".webp", ".gif"]:
+                  return ".jpg" if suffix == ".jpeg" else suffix
+              if content_type:
+                  guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
+                  if guessed:
+                      return ".jpg" if guessed == ".jpeg" else guessed
+              return ".png"
+
+          for idx, url in enumerate(urls, start=1):
+              last_error = None
+              for attempt in range(1, 4):
+                  try:
+                      req = Request(url, headers=headers)
+                      with urlopen(req, timeout=45) as resp:
+                          status = getattr(resp, "status", 200)
+                          content_type = resp.headers.get("Content-Type", "")
+                          data = resp.read()
+                      if status >= 400:
+                          raise RuntimeError(f"HTTP {status}")
+                      if len(data) < 128:
+                          raise RuntimeError(f"too small: {len(data)} bytes")
+                      ext = ext_from_response(url, content_type)
+                      name = f"image-{idx:03d}{ext}"
+                      path = out_dir / name
+                      path.write_bytes(data)
+                      manifest.append((idx, name, url, len(data), content_type))
+                      print(f"OK {idx:03d}: {name} {len(data)} bytes")
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print(f"Retry {attempt}/3 failed for {idx:03d}: {exc}")
+                      time.sleep(3 * attempt)
+              else:
+                  failures.append((idx, url, str(last_error)))
+
+          repo = "${{ github.repository }}"
+          branch = "${{ github.ref_name }}"
+          raw_lines = [
+              f"https://raw.githubusercontent.com/{repo}/{branch}/{out_dir.as_posix()}/{name}"
+              for _, name, _, _, _ in manifest
+          ]
+          (out_dir / "raw_urls.txt").write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+          manifest_lines = ["index,filename,size,content_type,source_url"]
+          for idx, name, url, size, content_type in manifest:
+              safe_url = url.replace('"', '""')
+              safe_type = content_type.replace('"', '""')
+              manifest_lines.append(f'{idx},"{name}",{size},"{safe_type}","{safe_url}"')
+          (out_dir / "manifest.csv").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+
+          if failures:
+              fail_lines = ["index,source_url,error"]
+              for idx, url, err in failures:
+                  fail_lines.append(f'{idx},"{url.replace(chr(34), chr(34)*2)}","{err.replace(chr(34), chr(34)*2)}"')
+              (out_dir / "failures.csv").write_text("\n".join(fail_lines) + "\n", encoding="utf-8")
+              raise SystemExit(f"{len(failures)} downloads failed. See public-images/failures.csv")
+
+          print(f"Downloaded {len(manifest)} images.")
+          PY
+
+      - name: Commit mirrored images
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add image_urls.txt "${{ inputs.output_dir || 'public-images' }}/"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Mirror image URLs to public-images"
+            git push
+          fi
